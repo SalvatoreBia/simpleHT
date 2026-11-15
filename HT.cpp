@@ -11,14 +11,12 @@ int main( int argc, char *argv[] )
 {
   Kokkos::initialize( argc, argv );
   {
-
     constexpr int width  = 100;
     constexpr int height = 100;
     constexpr int size   = width * height;
 
     Kokkos::View<double*> d_old( "old", size );
     Kokkos::View<double*> d_new( "new", size );
-
 
     Kokkos::parallel_for( "init_kernel", size, KOKKOS_LAMBDA( const int idx ){
       d_old( idx ) = 0.0;
@@ -32,12 +30,12 @@ int main( int argc, char *argv[] )
     });
 
     constexpr int max_it = 100;
-    for( int it = 0; it < max_it; it++)
+    for( int it = 0; it < max_it; it++ )
     {
 
       Kokkos::parallel_for(
         "transition_kernel", 
-        Kokkos::MDRangePolicy<Kokkos::Rank<2>>({0,0}, {width, height}),
+        Kokkos::MDRangePolicy<Kokkos::Rank<2>>({0,0}, {height, width}),
         KOKKOS_LAMBDA( const int i, const int j ){
        
           if( i > 0 && i < height - 1 )
