@@ -3,42 +3,81 @@
 #include <Kokkos_StdAlgorithms.hpp>
 #include <fstream>
 #include <iostream>
+#include <mpi.h>
 
 #define OUTPUT_PPM "output.ppm"
 
 
 int main( int argc, char *argv[] )
 {
+  MPI_Init( &argc, &argv );
   Kokkos::initialize( argc, argv );
   {
-    constexpr int width  = 100;
-    constexpr int height = 100;
+    constexpr int mpi_procs = 4;
+
+    constexpr int width  = 240;
+    constexpr int height = 240;
     constexpr int size   = width * height;
 
-    Kokkos::View<double*> d_old( "old", size );
-    Kokkos::View<double*> d_new( "new", size );
+    if constexpr( height % mpi_procs != 0 )
+    {
+      printf("Can't split horizontally: height=%d is not divisible by mpi_procs=%d\n", height, mpi_procs);
+      exit(1);
+    }
 
-    Kokkos::parallel_for( "init_kernel", size, KOKKOS_LAMBDA( const int idx ){
-      d_old( idx ) = 0.0;
-      d_new( idx ) = 0.0;
-      
-      if( idx < width || idx >= (size - width) )
+    int mpi_rank;
+    int mpi_count;
+    MPI_Comm_rank( MPI_COMM_WORLD, &mpi_rank );
+    MPI_Comm_size( MPI_COMM_WORLD, &mpi_count );
+    if( mpi_count != mpi_procs )
+    {
+      printf("mpi_procs=%d differs from the number of instantiated MPI processes (%d)\n", mpi_procs, mpi_count);
+      exit(1);
+    }
+
+    MPI_Barrier( MPI_COMM_WORLD );
+
+    int local_height = (height / mpi_procs) + 1;
+    if( mpi_rank != 0 && mpi_rank != mpi_count-1 ) local_height++;
+    int local_size = width * local_height;
+
+    Kokkos::View<double*> d_old( "old", local_size );
+    Kokkos::View<double*> d_new( "new", local_size );
+
+    // this is just an example init kernel, you can change it
+    // if you wish
+    const int chunk = height / mpi_procs;
+    const int start_owned_global = mpi_rank * chunk;
+    const int halo_top = (mpi_rank > 0) ? 1 : 0;
+
+    Kokkos::parallel_for( "init_kernel", local_size, KOKKOS_LAMBDA( const int idx ){
+      const int local_row  = idx / width;
+      const int global_row = start_owned_global + (local_row - halo_top);
+
+      double val = 0.0;
+      if( global_row == 0 || global_row == (height - 1) )
       {
-        d_old( idx ) = 40.0;
-        d_new( idx ) = 40.0;
+        val = 40.0;
       }
+
+      d_old( idx ) = val;
+      d_new( idx ) = val;
     });
 
-    constexpr int max_it = 100;
-    for( int it = 0; it < max_it; it++ )
+    constexpr int max_it = 10000;
+    for( int it = 0; it < max_it; it++)
     {
 
       Kokkos::parallel_for(
         "transition_kernel", 
-        Kokkos::MDRangePolicy<Kokkos::Rank<2>>({0,0}, {height, width}),
+        Kokkos::MDRangePolicy<Kokkos::Rank<2>>({0,0}, {local_height, width}),
         KOKKOS_LAMBDA( const int i, const int j ){
-       
-          if( i > 0 && i < height - 1 )
+          // Those are set like this because I am choosing to not
+          // update the top and bottom rows of the ENTIRE grid
+          int first_row = 1;
+          int last_row  = local_height-2;
+
+          if( i >= first_row && i <= last_row )
           {
             double up    = d_old( (i-1) * width + j );
             double down  = d_old( (i+1) * width + j );
@@ -53,18 +92,50 @@ int main( int argc, char *argv[] )
           }
 
       });
+      Kokkos::fence();
+     
+      if( mpi_count > 1 )
+      {
+        MPI_Request reqs[4];
+        int nreq = 0;
+
+        if( mpi_rank == 0 )
+        {
+          MPI_Irecv( d_new.data() + width*(local_height-1), width, MPI_DOUBLE, mpi_rank+1, 666, MPI_COMM_WORLD, &reqs[nreq++] );
+          MPI_Isend( d_new.data() + width*(local_height-2), width, MPI_DOUBLE, mpi_rank+1, 666, MPI_COMM_WORLD, &reqs[nreq++] );
+        }
+        else if( mpi_rank == mpi_count-1 )
+        {
+          MPI_Irecv( d_new.data(), width, MPI_DOUBLE, mpi_rank-1, 666, MPI_COMM_WORLD, &reqs[nreq++] );
+          MPI_Isend( d_new.data() + width, width, MPI_DOUBLE, mpi_rank-1, 666, MPI_COMM_WORLD, &reqs[nreq++] );
+        }
+        else
+        {
+          MPI_Irecv( d_new.data(), width, MPI_DOUBLE, mpi_rank-1, 666, MPI_COMM_WORLD, &reqs[nreq++] );
+          MPI_Isend( d_new.data() + width, width, MPI_DOUBLE, mpi_rank-1, 666, MPI_COMM_WORLD, &reqs[nreq++] );
+          MPI_Irecv( d_new.data() + width*(local_height-1), width, MPI_DOUBLE, mpi_rank+1, 666, MPI_COMM_WORLD, &reqs[nreq++] );
+          MPI_Isend( d_new.data() + width*(local_height-2), width, MPI_DOUBLE, mpi_rank+1, 666, MPI_COMM_WORLD, &reqs[nreq++] );
+        }
+
+        MPI_Waitall( nreq, reqs, MPI_STATUSES_IGNORE );
+      }
 
       std::swap( d_old, d_new );
 
     }
 
-    double min_temp = *Kokkos::Experimental::min_element( Kokkos::DefaultExecutionSpace(), d_new );
-    double max_temp = *Kokkos::Experimental::max_element( Kokkos::DefaultExecutionSpace(), d_new );
+    double min_temp_local = *Kokkos::Experimental::min_element( Kokkos::DefaultExecutionSpace(), d_old );
+    double max_temp_local = *Kokkos::Experimental::max_element( Kokkos::DefaultExecutionSpace(), d_old );
 
-    Kokkos::View<unsigned char*> rgb_buf( "rgb_buffer", size*3 );
-    Kokkos::parallel_for( "write_rgb_buffer_kernel", size, KOKKOS_LAMBDA( const int idx ){
+    double min_temp_global = 0.0;
+    double max_temp_global = 0.0;
+    MPI_Allreduce( &min_temp_local, &min_temp_global, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD );
+    MPI_Allreduce( &max_temp_local, &max_temp_global, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD );
 
-      double t = (d_new( idx ) - min_temp) / (max_temp - min_temp);
+    Kokkos::View<unsigned char*> rgb_buf( "rgb_buffer", local_size*3 );
+    Kokkos::parallel_for( "write_rgb_buffer_kernel", local_size, KOKKOS_LAMBDA( const int idx ){
+
+      double t = (d_old( idx ) - min_temp_global) / (max_temp_global - min_temp_global);
       if (t < 0.0) t = 0.0;
       if (t > 1.0) t = 1.0;
 
@@ -106,11 +177,32 @@ int main( int argc, char *argv[] )
 
     auto h_rgb = Kokkos::create_mirror_view_and_copy( rgb_buf );
 
-    std::ofstream out( OUTPUT_PPM, std::ios::binary );
-    const std::string header = "P6\n" + std::to_string(width) + " " + std::to_string(height) + "\n255\n";
-    out.write( header.c_str(), header.length() );
-    out.write( reinterpret_cast<const char*>(h_rgb.data()), size * 3 );
+    if( mpi_count > 1 )
+    {
+      const int elem_count = 3 * (height / mpi_count) * width;
+      if( mpi_rank == 0 )
+      {
+        std::ofstream out( OUTPUT_PPM, std::ios::binary );
+        const std::string header = "P6\n" + std::to_string(width) + " " + std::to_string(height) + "\n255\n";
+        out.write( header.c_str(), header.length() );
+        out.write( reinterpret_cast<const char*>(h_rgb.data()), elem_count );
+
+        std::vector<unsigned char> recv_buf( elem_count );
+        for( int i = 1; i < mpi_count; ++i )
+        {
+          MPI_Recv( recv_buf.data(), elem_count, MPI_UNSIGNED_CHAR, i, 666, MPI_COMM_WORLD, MPI_STATUS_IGNORE );
+          out.write( reinterpret_cast<const char*>(recv_buf.data()), elem_count );
+        }
+      }
+      else
+      {
+        MPI_Request req;
+        MPI_Isend( h_rgb.data() + 3*width, elem_count, MPI_UNSIGNED_CHAR, 0, 666, MPI_COMM_WORLD, &req );
+        MPI_Wait( &req, MPI_STATUS_IGNORE );
+      }
+    }
   }
   Kokkos::finalize();
+  MPI_Finalize();
   return 0;
 }
