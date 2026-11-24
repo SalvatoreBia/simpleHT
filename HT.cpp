@@ -5,7 +5,7 @@
 #include <iostream>
 #include <mpi.h>
 
-#define OUTPUT_PPM "output.ppm"
+#include "parameters.hpp"
 
 
 int main( int argc, char *argv[] )
@@ -13,12 +13,6 @@ int main( int argc, char *argv[] )
   MPI_Init( &argc, &argv );
   Kokkos::initialize( argc, argv );
   {
-    constexpr int mpi_procs = 4;
-
-    constexpr int width  = 240;
-    constexpr int height = 240;
-    constexpr int size   = width * height;
-
     if constexpr( height % mpi_procs != 0 )
     {
       printf("Can't split horizontally: height=%d is not divisible by mpi_procs=%d\n", height, mpi_procs);
@@ -35,6 +29,7 @@ int main( int argc, char *argv[] )
       exit(1);
     }
 
+    using halo_view = Kokkos::View<double*, Kokkos::HostSpace>;
     MPI_Barrier( MPI_COMM_WORLD );
 
     int local_height = (height / mpi_procs) + 1;
@@ -64,7 +59,6 @@ int main( int argc, char *argv[] )
       d_new( idx ) = val;
     });
 
-    constexpr int max_it = 10000;
     for( int it = 0; it < max_it; it++)
     {
 
@@ -99,25 +93,45 @@ int main( int argc, char *argv[] )
         MPI_Request reqs[4];
         int nreq = 0;
 
-        if( mpi_rank == 0 )
+        size_t send_down_offset = width * (local_height - 2);
+        size_t recv_down_offset = width * (local_height - 1);
+        size_t send_up_offset   = width;
+        size_t recv_up_offset   = 0;
+
+        halo_view recv_up_buf, recv_down_buf, send_up_buf, send_down_buf;
+
+        auto recv_up_sv   = Kokkos::subview( d_new, std::make_pair(recv_up_offset, recv_up_offset + width) );
+        auto recv_down_sv = Kokkos::subview( d_new, std::make_pair(recv_down_offset, recv_down_offset + width) );
+        auto send_up_sv   = Kokkos::subview( d_new, std::make_pair(send_up_offset, send_up_offset + width) );
+        auto send_down_sv = Kokkos::subview( d_new, std::make_pair(send_down_offset, send_down_offset + width) );
+
+        if( mpi_rank > 0 )
         {
-          MPI_Irecv( d_new.data() + width*(local_height-1), width, MPI_DOUBLE, mpi_rank+1, 666, MPI_COMM_WORLD, &reqs[nreq++] );
-          MPI_Isend( d_new.data() + width*(local_height-2), width, MPI_DOUBLE, mpi_rank+1, 666, MPI_COMM_WORLD, &reqs[nreq++] );
+          recv_up_buf = Kokkos::create_mirror_view( Kokkos::HostSpace(), recv_up_sv );
+          send_up_buf = Kokkos::create_mirror_view_and_copy( Kokkos::HostSpace(), send_up_sv );
+          
+          MPI_Irecv( recv_up_buf.data(), width, MPI_DOUBLE, mpi_rank-1, 666, MPI_COMM_WORLD, &reqs[nreq++] );
+          MPI_Isend( send_up_buf.data(), width, MPI_DOUBLE, mpi_rank-1, 666, MPI_COMM_WORLD, &reqs[nreq++] );
         }
-        else if( mpi_rank == mpi_count-1 )
+        if( mpi_rank < mpi_count - 1 )
         {
-          MPI_Irecv( d_new.data(), width, MPI_DOUBLE, mpi_rank-1, 666, MPI_COMM_WORLD, &reqs[nreq++] );
-          MPI_Isend( d_new.data() + width, width, MPI_DOUBLE, mpi_rank-1, 666, MPI_COMM_WORLD, &reqs[nreq++] );
-        }
-        else
-        {
-          MPI_Irecv( d_new.data(), width, MPI_DOUBLE, mpi_rank-1, 666, MPI_COMM_WORLD, &reqs[nreq++] );
-          MPI_Isend( d_new.data() + width, width, MPI_DOUBLE, mpi_rank-1, 666, MPI_COMM_WORLD, &reqs[nreq++] );
-          MPI_Irecv( d_new.data() + width*(local_height-1), width, MPI_DOUBLE, mpi_rank+1, 666, MPI_COMM_WORLD, &reqs[nreq++] );
-          MPI_Isend( d_new.data() + width*(local_height-2), width, MPI_DOUBLE, mpi_rank+1, 666, MPI_COMM_WORLD, &reqs[nreq++] );
+          recv_down_buf = Kokkos::create_mirror_view( Kokkos::HostSpace(), recv_down_sv );
+          send_down_buf = Kokkos::create_mirror_view_and_copy( Kokkos::HostSpace(), send_down_sv );
+          
+          MPI_Irecv( recv_down_buf.data(), width, MPI_DOUBLE, mpi_rank+1, 666, MPI_COMM_WORLD, &reqs[nreq++] );
+          MPI_Isend( send_down_buf.data(), width, MPI_DOUBLE, mpi_rank+1, 666, MPI_COMM_WORLD, &reqs[nreq++] );
         }
 
         MPI_Waitall( nreq, reqs, MPI_STATUSES_IGNORE );
+
+        if( mpi_rank > 0 )
+        {
+          Kokkos::deep_copy( recv_up_sv, recv_up_buf );
+        }
+        if( mpi_rank < mpi_count - 1 )
+        {
+          Kokkos::deep_copy( recv_down_sv, recv_down_buf );
+        }
       }
 
       std::swap( d_old, d_new );
