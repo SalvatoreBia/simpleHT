@@ -5,6 +5,7 @@
 #include <iostream>
 #include <mpi.h>
 
+#include "init_kernels.hpp"
 #include "parameters.hpp"
 
 
@@ -39,25 +40,13 @@ int main( int argc, char *argv[] )
     Kokkos::View<double*> d_old( "old", local_size );
     Kokkos::View<double*> d_new( "new", local_size );
 
-    // this is just an example init kernel, you can change it
-    // if you wish
     const int chunk = height / mpi_procs;
     const int start_owned_global = mpi_rank * chunk;
     const int halo_top = (mpi_rank > 0) ? 1 : 0;
 
-    Kokkos::parallel_for( "init_kernel", local_size, KOKKOS_LAMBDA( const int idx ){
-      const int local_row  = idx / width;
-      const int global_row = start_owned_global + (local_row - halo_top);
-
-      double val = 0.0;
-      if( global_row == 0 || global_row == (height - 1) )
-      {
-        val = 40.0;
-      }
-
-      d_old( idx ) = val;
-      d_new( idx ) = val;
-    });
+    // please find/define initialization kernels in `init_kernels.hpp`
+    DirichletInit init_fn( d_old, d_new, start_owned_global, halo_top );
+    Kokkos::parallel_for( "init_kernel", local_size, init_fn );
 
     for( int it = 0; it < max_it; it++)
     {
@@ -78,6 +67,12 @@ int main( int argc, char *argv[] )
 
             int j_left   = ( j > 0 )? (j-1) : j;
             int j_right  = ( j < width-1 )? (j+1) : j;
+            if( periodic_x )
+            {
+              j_left  = (j - 1 + width) % width;
+              j_right = (j + 1) %width;
+            }
+            
             double left  = d_old( i * width + j_left );
             double right = d_old( i * width + j_right );
 
